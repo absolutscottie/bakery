@@ -24,15 +24,6 @@ notify() {
   zeroclaw channel send "$msg" --channel-id telegram --recipient 8608375766 || true
 }
 
-ask() {
-  # Sends a question via ZeroClaw and writes the reply to the given file.
-  # Blocks until a reply is received.
-  local question="$1"
-  local answer_file="$2"
-  log "ASK: $question"
-  zeroclaw channel send "$question (write the answer to $answer_file)" --channel-id telegram --recipient 8608375766 || true
-}
-
 # ─── State file helpers ───────────────────────────────────────────────────────
 state_read() {
   jq -r ".$1 // empty" "$STATE_FILE" 2>/dev/null || true
@@ -57,7 +48,7 @@ state_write() {
 }
 
 state_init() {
-  mkdir -p "$AGENT_DIR" "$WORKDIR_ROOT"
+  mkdir -p "$AGENT_DIR" "$WORKDIR_ROOT" "$AGENT_DIR/sessions"
   cat > "$STATE_FILE" <<EOF
 {
   "state": "unlocked",
@@ -67,12 +58,12 @@ state_init() {
   "issue_number": "",
   "issue_title": "",
   "branch": "",
+  "default_branch": "main",
   "model": "",
   "run_id": "",
   "attempt": "0",
   "max_attempts": "3",
   "has_ci": "true",
-  "default_branch": "main",
   "updated_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
@@ -102,7 +93,7 @@ acquire_lock() {
 }
 
 release_lock() {
-  state_write "state" "unlocked"
+  state_write "state" "unlocked" "pid" ""
   log "Lock released"
 }
 
@@ -127,7 +118,7 @@ check_lock() {
   # PID is dead but lock is held — something fell over
   log "Dead PID $pid held lock (goal: $goal, repo: $repo, issue: #$issue_number, since: $updated_at)"
   notify "a dead lock was found. Goal was '$goal' on $repo issue #$issue_number (PID $pid, locked since $updated_at). Manual intervention required — run agent-reset on the Pi."
-  state_write "goal" "intervention_required" "state" "unlocked"
+  state_write "goal" "intervention_required" "state" "unlocked" "pid" ""
   exit 1
 }
 
@@ -147,7 +138,8 @@ do_find_issue() {
       --repo "$repo" \
       --state open \
       --json number,title,body,createdAt,labels \
-      --jq "[.[] | select(.labels | map(.name) | contains([\"$label\"]) | not)] | sort_by(.createdAt) | first // empty" 2>/dev/null || true)
+      --jq "[.[] | select(.labels | map(.name) | contains([\"$label\"]) | not)] | sort_by(.createdAt) | first // empty" \
+      2>/dev/null || true)
 
     [[ -z "$issue" ]] && continue
 
@@ -167,7 +159,7 @@ do_find_issue() {
     exit 0
   fi
 
-  local num title body branch slug has_ci max_attempts label
+  local num title body branch slug has_ci max_attempts label default_branch model
   num=$(echo "$found_issue"   | jq -r '.number')
   title=$(echo "$found_issue" | jq -r '.title')
   body=$(echo "$found_issue"  | jq -r '.body')
@@ -178,12 +170,18 @@ do_find_issue() {
   max_attempts="${max_attempts:-3}"
   label=$(repo_field "$found_repo" "in_progress_label")
   label="${label:-in-progress}"
-
-  local default_branch
   default_branch=$(repo_field "$found_repo" "default_branch")
   default_branch="${default_branch:-main}"
 
-  log "Picked issue #$num from $found_repo: $title (default branch: $default_branch)"
+  model=$(echo "$found_issue" | jq -r '
+    .labels[]?.name
+    | select(startswith("model:"))
+    | split(":")[1]
+    | "claude-" + . + "-4-5"
+  ' | head -1)
+  model="${model:-claude-haiku-4-5-20251001}"
+
+  log "Picked issue #$num from $found_repo: $title (branch: $default_branch, model: $model)"
 
   gh issue edit "$num" --repo "$found_repo" --add-label "$label"
 
@@ -195,14 +193,6 @@ do_find_issue() {
   cd "$workdir"
   git fetch origin
   git checkout -B "$branch" "origin/$default_branch"
-
-  model=$(echo "$found_issue" | jq -r '
-    .labels[]?.name
-    | select(startswith("model:"))
-    | split(":")[1]
-    | "claude-" + . + "-4-5"
-  ' | head -1)
-  model="${model:-claude-haiku-4-5-20251001}"
 
   state_write \
     "goal"           "waiting_for_claude" \
@@ -217,7 +207,7 @@ do_find_issue() {
     "has_ci"         "${has_ci:-true}" \
     "model"          "$model"
 
-  # Write prompt file — all dynamic, no hardcoded repo names
+  # Write prompt file
   local slug_path="workdir/$slug"
   cat > "$workdir/AGENT_PROMPT.md" <<PROMPT
 You are an autonomous coding agent.
@@ -247,7 +237,6 @@ $body
     gh issue comment $num --repo "$found_repo" --body "[AGENT QUESTION] your question here"
   Then stop immediately. Do not write any files to signal this.
   Do not ask questions you could answer by reading the codebase.
-- Do not ask questions you could answer by reading the codebase.
 
 ## Build verification
 You do not have a local build environment for this project. After
@@ -279,7 +268,7 @@ PROMPT
 
 # ─── Goal: waiting_for_claude ─────────────────────────────────────────────────
 do_invoke_claude() {
-  local repo num branch attempt slug workdir model issue_title
+  local repo num branch attempt slug workdir model issue_title default_branch session_file
   repo=$(state_read "repo")
   num=$(state_read "issue_number")
   branch=$(state_read "branch")
@@ -289,16 +278,41 @@ do_invoke_claude() {
   model=$(state_read "model")
   model="${model:-claude-haiku-4-5-20251001}"
   issue_title=$(state_read "issue_title")
+  default_branch=$(state_read "default_branch")
+  default_branch="${default_branch:-main}"
+  session_file="$AGENT_DIR/sessions/issue-${num}.json"
 
   log "Invoking ZeroClaw on $repo issue #$num (attempt $attempt, model $model)..."
 
+  mkdir -p "$AGENT_DIR/sessions"
   cd "$workdir"
   git checkout "$branch"
 
   zeroclaw agent \
     --model "$model" \
+    --session-state-file "$session_file" \
     -m "$(cat "$workdir/AGENT_PROMPT.md")" \
     >> "$LOG_FILE" 2>&1 || true
+
+  do_post_claude
+}
+
+# ─── Post-ZeroClaw: question check, commit check, push, PR ───────────────────
+do_post_claude() {
+  local repo num branch attempt slug workdir model issue_title default_branch
+  repo=$(state_read "repo")
+  num=$(state_read "issue_number")
+  branch=$(state_read "branch")
+  attempt=$(state_read "attempt")
+  slug=$(repo_slug "$repo")
+  workdir="$WORKDIR_ROOT/$slug"
+  model=$(state_read "model")
+  model="${model:-claude-haiku-4-5-20251001}"
+  issue_title=$(state_read "issue_title")
+  default_branch=$(state_read "default_branch")
+  default_branch="${default_branch:-main}"
+
+  cd "$workdir"
 
   # Check if agent posted a question on the issue
   local agent_question
@@ -319,9 +333,7 @@ do_invoke_claude() {
   fi
 
   # Check if agent actually committed anything
-  local default_branch commits_ahead
-  default_branch=$(state_read "default_branch")
-  default_branch="${default_branch:-main}"
+  local commits_ahead
   commits_ahead=$(git rev-list --count "origin/$default_branch..HEAD")
 
   if [[ "$commits_ahead" -eq 0 ]]; then
@@ -372,9 +384,10 @@ do_invoke_claude() {
     do_build_passed
   fi
 }
+
 # ─── Goal: waiting_for_answer ─────────────────────────────────────────────────
 do_resume_after_answer() {
-  local repo num slug workdir label model branch
+  local repo num slug workdir label model branch session_file
   repo=$(state_read "repo")
   num=$(state_read "issue_number")
   slug=$(repo_slug "$repo")
@@ -384,6 +397,7 @@ do_resume_after_answer() {
   model=$(state_read "model")
   model="${model:-claude-haiku-4-5-20251001}"
   branch=$(state_read "branch")
+  session_file="$AGENT_DIR/sessions/issue-${num}.json"
 
   log "Checking for answer on $repo issue #$num..."
 
@@ -443,86 +457,24 @@ do_resume_after_answer() {
       ;;
   esac
 
-  # We have a Q&A thread — build resume prompt
-  log "Answer received on issue #$num — building resume prompt"
-
-  local original_prompt
-  original_prompt=$(cat "$workdir/AGENT_PROMPT.md")
-
-  cat > "$workdir/RESUME_PROMPT.md" <<PROMPT
-$original_prompt
-
----
-
-## Questions and answers
-
-The following exchange took place on the GitHub issue while you were
-working. Please continue your work taking these answers into account.
-
-$qa_result
-
-Please continue implementing the fix for issue #$num.
-PROMPT
-
+  # We have a Q&A thread — resume via session file
+  log "Answer received on issue #$num — resuming via session file"
   state_write "goal" "waiting_for_claude"
   notify "resuming work on $repo issue #$num after receiving an answer. Check the issue for context: https://github.com/$repo/issues/$num"
 
   zeroclaw agent \
     --model "$model" \
-    -m "$(cat "$workdir/RESUME_PROMPT.md")" \
+    --session-state-file "$session_file" \
+    -m "A human has answered your question on the issue. Here is the Q&A thread:
+
+$qa_result
+
+Please continue implementing the fix for issue #$num." \
     >> "$LOG_FILE" 2>&1 || true
 
-  # Check for commits
-  local default_branch commits_ahead
-  default_branch=$(state_read "default_branch")
-  default_branch="${default_branch:-main}"
-  commits_ahead=$(git -C "$workdir" rev-list --count "origin/$default_branch..HEAD")
-
-  if [[ "$commits_ahead" -eq 0 ]]; then
-    log "No commits after resume on $repo issue #$num"
-    notify "the agent resumed on $repo issue #$num but made no commits. Manual attention needed."
-    gh issue edit "$num" --repo "$repo" --remove-label "$label"
-    state_write \
-      "goal"         "intervention_required" \
-      "issue_number" "" \
-      "repo"         "" \
-      "branch"       "" \
-      "run_id"       ""
-    release_lock
-    exit 1
-  fi
-
-  git -C "$workdir" push --force origin "$branch"
-
-  local pr_exists
-  pr_exists=$(gh pr list \
-    --repo "$repo" \
-    --head "$branch" \
-    --json number \
-    --jq 'length')
-
-  if [[ "$pr_exists" -eq 0 ]]; then
-    gh pr create \
-      --repo "$repo" \
-      --title "Fix #$num: $(state_read 'issue_title')" \
-      --body "Automated fix for issue #$num by coding-agent." \
-      --head "$branch" \
-      --base "$default_branch"
-    log "PR created for $repo branch $branch"
-  else
-    log "PR already exists — force push triggered a new Actions run"
-  fi
-
-  local has_ci
-  has_ci=$(state_read "has_ci")
-
-  if [[ "$has_ci" == "true" ]]; then
-    state_write "goal" "waiting_on_build"
-    do_poll_build
-  else
-    do_build_passed
-  fi
+  do_post_claude
 }
+
 # ─── Goal: waiting_on_build ───────────────────────────────────────────────────
 do_poll_build() {
   local repo branch num run_id
@@ -540,7 +492,8 @@ do_poll_build() {
       --repo "$repo" \
       --branch "$branch" \
       --json databaseId,createdAt \
-      --jq 'sort_by(.createdAt) | last | .databaseId // empty' 2>/dev/null || true)
+      --jq 'sort_by(.createdAt) | last | .databaseId // empty' \
+      2>/dev/null || true)
 
     if [[ -z "$run_id" ]]; then
       log "No Actions run found yet for $repo branch $branch. Will retry next cron."
@@ -558,7 +511,8 @@ do_poll_build() {
   conclusion=$(gh run view "$run_id" \
     --repo "$repo" \
     --json conclusion \
-    --jq '.conclusion // empty' 2>/dev/null || true)
+    --jq '.conclusion // empty' \
+    2>/dev/null || true)
 
   if [[ -z "$conclusion" || "$conclusion" == "null" ]]; then
     log "Run $run_id still in progress. Will check again next cron."
@@ -575,6 +529,7 @@ do_poll_build() {
     do_build_failed
   fi
 }
+
 # ─── Build passed ─────────────────────────────────────────────────────────────
 do_build_passed() {
   local repo num branch pr_url
@@ -586,7 +541,8 @@ do_build_passed() {
     --repo "$repo" \
     --head "$branch" \
     --json url \
-    --jq 'first | .url // empty' 2>/dev/null || true)
+    --jq 'first | .url // empty' \
+    2>/dev/null || true)
 
   log "Build passed for $repo issue #$num"
   notify "the build passed for $repo issue #$num: $(state_read 'issue_title'). The PR is ready for your review: $pr_url"
@@ -597,7 +553,7 @@ do_build_passed() {
 
 # ─── Build failed ─────────────────────────────────────────────────────────────
 do_build_failed() {
-  local repo num attempt max_attempts run_id slug workdir label
+  local repo num attempt max_attempts run_id slug workdir label model session_file
   repo=$(state_read "repo")
   num=$(state_read "issue_number")
   attempt=$(state_read "attempt")
@@ -605,6 +561,9 @@ do_build_failed() {
   run_id=$(state_read "run_id")
   slug=$(repo_slug "$repo")
   workdir="$WORKDIR_ROOT/$slug"
+  model=$(state_read "model")
+  model="${model:-claude-haiku-4-5-20251001}"
+  session_file="$AGENT_DIR/sessions/issue-${num}.json"
 
   log "Build failed on attempt $attempt of $max_attempts for $repo issue #$num"
 
@@ -633,21 +592,6 @@ do_build_failed() {
     | head -100 \
     || echo "(could not retrieve build log)")
 
-  cat >> "$workdir/AGENT_PROMPT.md" <<FIXPROMPT
-
----
-
-## Build failure — attempt $attempt
-
-Your previous changes caused a build failure. Compiler errors:
-
-\`\`\`
-$build_log
-\`\`\`
-
-Fix these errors and amend your commit.
-FIXPROMPT
-
   local next_attempt=$((attempt + 1))
   state_write \
     "goal"    "waiting_for_claude" \
@@ -656,7 +600,19 @@ FIXPROMPT
 
   notify "the build failed on $repo issue #$num (attempt $attempt of $max_attempts). Retrying with compiler errors as context."
 
-  do_invoke_claude
+  zeroclaw agent \
+    --model "$model" \
+    --session-state-file "$session_file" \
+    -m "The build failed on attempt $attempt. Compiler errors:
+
+\`\`\`
+$build_log
+\`\`\`
+
+Please fix these errors and amend your commit." \
+    >> "$LOG_FILE" 2>&1 || true
+
+  do_post_claude
 }
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
@@ -703,12 +659,14 @@ main() {
         --head "$branch" \
         --state all \
         --json state,mergedAt \
-        --jq 'first | .state // empty' 2>/dev/null || true)
+        --jq 'first | .state // empty' \
+        2>/dev/null || true)
 
       if [[ "$pr_state" == "MERGED" || "$pr_state" == "CLOSED" ]]; then
         log "PR for issue #$issue_number was $pr_state — resetting to looking_for_work"
         gh issue edit "$issue_number" --repo "$repo" --remove-label "$label" 2>/dev/null || true
         gh issue close "$issue_number" --repo "$repo" 2>/dev/null || true
+        rm -f "$AGENT_DIR/sessions/issue-${issue_number}.json"
         state_write \
           "goal"         "looking_for_work" \
           "repo"         "" \
