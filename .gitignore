@@ -1,0 +1,9 @@
+# Runtime files — never commit these
+env
+state.json
+agent.log
+sessions/
+workdir/
+
+# But keep the example
+!env.example
