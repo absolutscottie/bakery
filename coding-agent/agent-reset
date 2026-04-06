@@ -1,0 +1,41 @@
+#!/bin/bash
+# ~/coding-agent/agent-reset
+# Clears the state file back to looking_for_work.
+# Run this manually after resolving an intervention_required situation.
+
+STATE_FILE="$HOME/coding-agent/state.json"
+
+if [[ ! -f "$STATE_FILE" ]]; then
+  echo "No state file found at $STATE_FILE"
+  exit 1
+fi
+
+CURRENT_GOAL=$(jq -r '.goal' "$STATE_FILE")
+CURRENT_STATE=$(jq -r '.state' "$STATE_FILE")
+CURRENT_REPO=$(jq -r '.repo' "$STATE_FILE")
+CURRENT_ISSUE=$(jq -r '.issue_number' "$STATE_FILE")
+
+echo "Current state : $CURRENT_STATE"
+echo "Current goal  : $CURRENT_GOAL"
+echo "Current repo  : $CURRENT_REPO"
+echo "Current issue : #$CURRENT_ISSUE"
+echo ""
+read -r -p "Reset to looking_for_work? [y/N] " confirm
+
+if [[ "$confirm" =~ ^[Yy]$ ]]; then
+  jq '. + {
+    "state": "unlocked",
+    "pid": "",
+    "goal": "looking_for_work",
+    "repo": "",
+    "issue_number": "",
+    "issue_title": "",
+    "branch": "",
+    "default_branch": "",
+    "run_id": "",
+    "attempt": "0"
+  }' "$STATE_FILE" > "${STATE_FILE}.tmp" && mv "${STATE_FILE}.tmp" "$STATE_FILE"
+  echo "Reset complete."
+else
+  echo "Aborted."
+fi

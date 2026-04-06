@@ -1,0 +1,10 @@
+[
+  {
+    "repo": "your_username/your_repo_name",
+    "enabled": true,
+    "in_progress_label": "looking_for_work",
+    "max_attempts": 3,
+    "has_ci": true,
+    "default_branch": "main"
+  } 
+]
