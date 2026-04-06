@@ -1,6 +1,6 @@
 # bakery
 
-An autonomous coding agent that runs on a Raspberry Pi. It monitors GitHub repositories for open issues, implements fixes using the Claude API via ZeroClaw, and opens pull requests — with GitHub Actions providing build verification and Telegram delivering human-in-the-loop notifications.
+An autonomous coding agent that runs on a Raspberry Pi. It monitors GitHub repositories for open issues, implements fixes using the Claude API via ZeroClaw, and opens pull requests — with GitHub Actions providing build verification and Telegram delivering human-in-the-loop notifications. Many of the design choices were a result of the hardware that it was being developed on. The Raspberry Pi 1 model B was released in 2012 and sports a 700mhz ARMV6 processor with 512 GB RAM. 
 
 ## How it works
 
