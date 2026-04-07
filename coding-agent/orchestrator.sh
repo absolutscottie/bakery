@@ -129,6 +129,7 @@ do_find_issue() {
   local found_repo="" found_issue="" oldest_date=""
 
   while IFS= read -r repo; do
+    log "looking for open issues in repo: $repo"
     local label
     label=$(repo_field "$repo" "in_progress_label")
     label="${label:-in-progress}"
@@ -282,7 +283,7 @@ do_invoke_claude() {
   default_branch="${default_branch:-main}"
   session_file="$AGENT_DIR/sessions/issue-${num}.json"
 
-  log "Invoking ZeroClaw on $repo issue #$num (attempt $attempt, model $model)..."
+  log "Invoking ZeroClaw on $repo issue #$num (attempt $attempt, model $model, session file $session_file)..."
 
   mkdir -p "$AGENT_DIR/sessions"
   cd "$workdir"
@@ -646,13 +647,54 @@ main() {
       do_poll_build
       ;;
     waiting_on_approval)
-      local repo branch issue_number label
+      local repo branch issue_number label model
       repo=$(state_read "repo")
       branch=$(state_read "branch")
       issue_number=$(state_read "issue_number")
       label=$(repo_field "$repo" "in_progress_label")
       label="${label:-in-progress}"
+      model=$(state_read "model")
+      model="${model:-claude-haiku-4-5-20251001}"
 
+      # Check for feedback comments on the PR posted after the last commit
+      local last_commit_date session_file feedback
+      last_commit_date=$(gh api "repos/$repo/commits?sha=$branch&per_page=1" \
+        --jq '.[0].commit.committer.date // empty' 2>/dev/null || true)
+      session_file="$AGENT_DIR/sessions/issue-${issue_number}.json"
+
+      if [[ -n "$last_commit_date" ]]; then
+	log "checking for feedback on branch: $branch, repo: $repo, date: $last_commit_date"
+	feedback=$(gh pr view "$branch" \
+          --repo "$repo" \
+          --comments \
+          --json comments \
+          --jq "[.comments[] | select(.body | startswith(\"[FEEDBACK]\")) | select(.createdAt > \"$last_commit_date\")] | last | .body // empty" \
+          2>/dev/null || true)
+      fi
+
+      if [[ -n "$feedback" ]]; then
+        log "Feedback received on PR for $repo issue #$issue_number"
+        local next_attempt
+        next_attempt=$(($(state_read "attempt") + 1))
+        state_write "goal" "waiting_for_claude" "attempt" "$next_attempt" "run_id" ""
+        notify "acting on PR feedback for $repo issue #$issue_number."
+
+        zeroclaw agent \
+          --model "$model" \
+          --session-state-file "$session_file" \
+          -m "The reviewer left feedback on the PR:
+
+$(echo "$feedback" | sed 's/^\[FEEDBACK\] //')
+
+Please update your implementation accordingly and amend your commit." \
+          >> "$LOG_FILE" 2>&1 || true
+
+        do_post_claude
+        release_lock
+        return
+      fi
+
+      # No feedback — check for merge or close as before
       local pr_state
       pr_state=$(gh pr list \
         --repo "$repo" \
